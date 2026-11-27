@@ -1,0 +1,6 @@
+# Relatórios HTML são GERADOS pelo R Markdown (rmarkdown::render):
+# não entram na contagem de linguagens do GitHub.
+*.html linguist-generated=true linguist-detectable=false
+
+# O R Markdown contém o código R da análise: conta como R.
+*.Rmd linguist-detectable=true linguist-language=R

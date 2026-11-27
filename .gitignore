@@ -1,0 +1,14 @@
+.Rhistory
+.RData
+.Rproj.user/
+*_cache/
+Rplots.pdf
+~$*
+.DS_Store
+Thumbs.db
+
+# Relatórios HTML gerados pelo rmarkdown::render (o PDF e o .Rmd ficam no repositório)
+*.html
+
+# Roteiros de fala: material pessoal, não vai para o repositório
+roteiro_*

@@ -1,0 +1,1123 @@
+---
+title: "A transição energética no Sistema Interligado Nacional (2016–2025)"
+subtitle: "Projeto de Ciência de Dados em R com dados abertos do ONS"
+author: "Daniel Quiteque"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+params:
+  mostrar_codigo: true
+---
+
+```{r setup, include=FALSE}
+# O relatório roda a partir da raiz do projeto (a pasta acima de 4_codigo_R),
+# para que os caminhos "3_dados/..." funcionem de qualquer lugar.
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(
+  echo = params$mostrar_codigo, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5.5, dpi = 150, fig.align = "center"
+)
+```
+
+# Introdução
+
+## Contexto
+
+A matriz elétrica brasileira é historicamente dominada pelas hidrelétricas. Na
+última década, porém, a geração **eólica** (concentrada no Nordeste) e a
+**solar** cresceram muito rápido, enquanto a crise hídrica de 2021 obrigou o
+país a acionar usinas **térmicas**, mais caras e poluentes. Este projeto usa
+os dados abertos do **Operador Nacional do Sistema Elétrico (ONS)** para
+medir essa transformação.
+
+**Pergunta principal:** *como a expansão eólica e solar mudou a forma como o
+Brasil gera eletricidade entre 2016 e 2025?*
+
+**Hipóteses:**
+
+- **H1** – A participação eólica + solar na geração do SIN cresceu de forma significativa no período.
+- **H2** – A geração eólica no Nordeste tem forte sazonalidade, sendo maior na "safra dos ventos" (julho a novembro).
+- **H3** – A geração térmica é acionada para compensar a hidráulica: as duas são negativamente associadas.
+
+**Perguntas de machine learning:**
+
+- **ML1** – É possível prever o consumo do dia seguinte com erro abaixo de 2%? Quais fatores mais pesam?
+- **ML2** – Sem nenhum rótulo, um algoritmo consegue descobrir sozinho os “tipos de dia” do sistema, inclusive a curva do pato?
+
+## Os dados
+
+**Fonte:** ONS, *Balanço de Energia nos Subsistemas*, base horária.
+Portal: <https://dados.ons.org.br/dataset/balanco-energia-subsistema>
+(licença CC-BY). Os arquivos ficam em `3_dados/brutos` e podem ser baixados de
+novo pelo script `4_codigo_R/baixar_dados.R`.
+
+Cada linha é **uma hora** em **um subsistema**. Os valores estão em
+**MWmed**, a potência média na hora (numericamente igual aos MWh gerados
+naquela hora).
+
+| Variável            | Tipo                 | Descrição                                          |
+|---------------------|----------------------|----------------------------------------------------|
+| `id_subsistema`     | categórica (5 níveis)| SE/CO, Sul, Nordeste, Norte e SIN (total nacional) |
+| `din_instante`      | data-hora            | Início da hora (2016-01-01 a 2025-12-31)           |
+| `val_gerhidraulica` | numérica contínua    | Geração hidráulica (MWmed)                         |
+| `val_gertermica`    | numérica contínua    | Geração térmica (MWmed)                            |
+| `val_gereolica`     | numérica contínua    | Geração eólica (MWmed)                             |
+| `val_gersolar`      | numérica contínua    | Geração solar centralizada (MWmed)                 |
+| `val_carga`         | numérica contínua    | Carga, ou seja, a demanda atendida (MWmed)         |
+| `val_intercambio`   | numérica contínua    | Geração − carga: positivo = exporta energia        |
+
+# Preparação
+
+## Pacotes
+
+```{r pacotes}
+library(tidyverse)   # dplyr, ggplot2, tidyr, lubridate, readr, forcats
+library(scales)      # formatação de eixos
+library(ggridges)    # ridgeline plot
+library(corrplot)    # matriz de correlação
+library(ranger)      # random forest
+library(xgboost)     # gradient boosting
+```
+
+## Tema e paletas
+
+Cada fonte e cada subsistema recebe **sempre a mesma cor** em todos os
+gráficos. As cores vêm das paletas Okabe-Ito e Paul Tol, que são legíveis por
+pessoas com daltonismo.
+
+```{r tema}
+fontes  <- c(hidraulica = "Hidráulica", termica = "Térmica",
+             eolica = "Eólica", solar = "Solar")
+cores_fonte <- c("Hidráulica" = "#0072B2", "Térmica" = "#D55E00",
+                 "Eólica" = "#009E73", "Solar" = "#E69F00")
+
+subsis  <- c(SE = "Sudeste/C.-Oeste", S = "Sul", NE = "Nordeste", N = "Norte")
+cores_sub <- c("Sudeste/C.-Oeste" = "#332288", "Sul" = "#88CCEE",
+               "Nordeste" = "#CC6677", "Norte" = "#117733")
+
+meses <- c("jan", "fev", "mar", "abr", "mai", "jun",
+           "jul", "ago", "set", "out", "nov", "dez")
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          plot.caption = element_text(color = "grey45", size = 9),
+          panel.grid.minor = element_blank(),
+          legend.position = "top")
+)
+fonte_dados <- "Fonte: ONS – Balanço de Energia nos Subsistemas (dados abertos)"
+```
+
+## Leitura
+
+```{r leitura}
+arquivos <- list.files("3_dados/brutos", pattern = "\\.csv$", full.names = TRUE)
+
+bruto <- map_dfr(arquivos, ~ read_delim(.x, delim = ";", show_col_types = FALSE,
+                                        col_types = cols(.default = col_character())))
+dim(bruto)
+glimpse(bruto)
+```
+
+## Limpeza e qualidade
+
+```{r limpeza}
+horario <- bruto %>%
+  transmute(
+    subsistema  = id_subsistema,
+    instante    = ymd_hms(din_instante),
+    hidraulica  = as.numeric(val_gerhidraulica),
+    termica     = as.numeric(val_gertermica),
+    eolica      = as.numeric(val_gereolica),
+    solar       = as.numeric(val_gersolar),
+    carga       = as.numeric(val_carga),
+    intercambio = as.numeric(val_intercambio)
+  )
+
+# Diagnóstico de qualidade ANTES de tratar
+horario %>%
+  summarise(across(-c(subsistema, instante), ~ sum(is.na(.x)), .names = "na_{.col}"),
+            carga_zero = sum(carga == 0, na.rm = TRUE))
+```
+
+Decisões de limpeza:
+
+- Os poucos valores **ausentes de geração solar** ocorrem quando a geração era nula, então são tratados como 0.
+- Uma **carga igual a zero** é fisicamente impossível num subsistema inteiro. É erro de medição e vira `NA`.
+
+```{r limpeza2}
+horario <- horario %>%
+  mutate(
+    across(c(hidraulica, termica, eolica, solar), ~ replace_na(.x, 0)),
+    carga   = if_else(carga <= 0, NA_real_, carga),
+    geracao = hidraulica + termica + eolica + solar,
+    ano     = year(instante),
+    mes     = factor(meses[month(instante)], levels = meses),
+    hora    = hour(instante),
+    data    = as_date(instante)
+  )
+
+# Total nacional (SIN) e subsistemas em tabelas separadas
+sin <- horario %>% filter(subsistema == "SIN")
+reg <- horario %>% filter(subsistema != "SIN") %>%
+  mutate(subsistema = factor(subsis[subsistema], levels = subsis))
+
+# Formato longo (uma linha por fonte), útil para o ggplot
+para_longo <- function(df) {
+  df %>%
+    pivot_longer(c(hidraulica, termica, eolica, solar),
+                 names_to = "fonte", values_to = "mw") %>%
+    mutate(fonte = factor(fontes[fonte], levels = fontes))
+}
+sin_longo <- para_longo(sin)
+reg_longo <- para_longo(reg)
+
+# Agregação diária do SIN
+sin_dia <- sin %>%
+  group_by(data) %>%
+  summarise(across(c(hidraulica, termica, eolica, solar, carga, geracao),
+                   ~ mean(.x, na.rm = TRUE))) %>%
+  mutate(vre = (eolica + solar) / geracao,       # participação eólica + solar
+         ano = year(data),
+         mes = factor(meses[month(data)], levels = meses))
+
+# Energia anual (TWh) por fonte
+anual <- sin_longo %>%
+  group_by(ano, fonte) %>%
+  summarise(twh = sum(mw) / 1e6, .groups = "drop")
+```
+
+## Estatística descritiva
+
+```{r descritiva}
+anual %>%
+  group_by(ano) %>%
+  mutate(pct = twh / sum(twh)) %>%
+  ungroup() %>%
+  filter(ano %in% c(2016, 2020, 2025)) %>%
+  mutate(valor = sprintf("%.0f TWh (%.1f%%)", twh, 100 * pct)) %>%
+  select(ano, fonte, valor) %>%
+  pivot_wider(names_from = ano, values_from = valor) %>%
+  knitr::kable(caption = "Geração anual do SIN por fonte")
+```
+
+```{r descritiva2}
+sin_dia %>%
+  summarise(across(c(carga, hidraulica, termica, eolica, solar),
+                   list(media = ~ mean(.x, na.rm = TRUE), dp = ~ sd(.x, na.rm = TRUE),
+                        min = ~ min(.x, na.rm = TRUE), max = ~ max(.x, na.rm = TRUE)))) %>%
+  pivot_longer(everything(), names_to = c("variavel", "estatistica"), names_sep = "_") %>%
+  pivot_wider(names_from = estatistica, values_from = value) %>%
+  mutate(across(where(is.numeric), ~ round(.x / 1000, 1))) %>%
+  knitr::kable(caption = "Médias diárias do SIN, 2016–2025 (GWmed)")
+```
+
+# Gráficos em R base
+
+Antes do `ggplot2`, todo curso de R ensina os gráficos do pacote `graphics`.
+
+```{r base-r, fig.height=8}
+d25 <- filter(anual, ano == 2025)
+mensal_carga <- sin %>%
+  group_by(mes_ini = floor_date(data, "month")) %>%
+  summarise(carga = mean(carga, na.rm = TRUE))
+
+par(mfrow = c(2, 3), mar = c(4.5, 4.5, 3, 1))
+
+# 1. Histograma
+hist(sin$carga / 1000, breaks = 40, col = "grey75", border = "white",
+     main = "Histograma", xlab = "Carga horária do SIN (GW)", ylab = "Frequência")
+
+# 2. Boxplot
+boxplot(carga / 1000 ~ subsistema, data = filter(reg, ano == 2025),
+        col = cores_sub, names = c("SE/CO", "S", "NE", "N"),
+        main = "Boxplot (2025)", xlab = "", ylab = "Carga horária (GW)")
+
+# 3. Dispersão com reta de regressão
+plot(sin_dia$hidraulica / 1000, sin_dia$termica / 1000, pch = 16,
+     col = adjustcolor("grey30", 0.25), main = "Dispersão",
+     xlab = "Hidráulica (GWmed/dia)", ylab = "Térmica (GWmed/dia)")
+abline(lm(I(termica / 1000) ~ I(hidraulica / 1000), data = sin_dia), col = "#D55E00", lwd = 2)
+
+# 4. Barras
+barplot(d25$twh, names.arg = d25$fonte, col = cores_fonte,
+        main = "Barras (2025)", ylab = "TWh")
+
+# 5. Pizza (ver discussão abaixo)
+pie(d25$twh, labels = d25$fonte, col = cores_fonte, main = "Pizza (2025)")
+
+# 6. Linha
+plot(mensal_carga$mes_ini, mensal_carga$carga / 1000, type = "l", lwd = 2,
+     main = "Linha", xlab = "", ylab = "Carga média mensal (GW)")
+
+par(mfrow = c(1, 1))
+```
+
+> **Nota crítica sobre o gráfico de pizza.** O olho humano compara ângulos
+> muito pior do que comprimentos. Na pizza é difícil dizer se a eólica é maior
+> que a térmica; no gráfico de barras a resposta é imediata. Por isso, nas
+> próximas seções, as proporções aparecem em barras.
+
+## Matriz de dispersão (`pairs`)
+
+```{r pairs, fig.height=7}
+set.seed(42)
+amostra <- sin_dia %>% slice_sample(n = 800)
+pairs(amostra[, c("carga", "hidraulica", "termica", "eolica", "solar")] / 1000,
+      labels = c("Carga", "Hidráulica", "Térmica", "Eólica", "Solar"),
+      pch = 16, col = adjustcolor("#0072B2", 0.35),
+      main = "Matriz de dispersão – médias diárias do SIN (GW), amostra de 800 dias")
+```
+
+## Série temporal: decomposição e autocorrelação
+
+A decomposição clássica separa a série mensal da carga em **tendência**,
+**sazonalidade** e **resíduo**.
+
+```{r decomposicao, fig.height=7}
+carga_ts <- ts(mensal_carga$carga / 1000, start = c(2016, 1), frequency = 12)
+plot(decompose(carga_ts))
+```
+
+```{r acf, fig.height=4.5}
+acf(carga_ts, lag.max = 36, main = "Autocorrelação da carga mensal do SIN")
+```
+
+Os picos de autocorrelação nas defasagens 12, 24 e 36 confirmam a **sazonalidade anual**.
+
+# Gráficos com ggplot2
+
+## Composição da matriz
+
+### Barras empilhadas 100%
+
+```{r barras-100}
+ggplot(anual, aes(x = factor(ano), y = twh, fill = fonte)) +
+  geom_col(position = "fill", width = 0.75, color = "white", linewidth = 0.3) +
+  scale_y_continuous(labels = label_percent()) +
+  scale_fill_manual(values = cores_fonte) +
+  labs(title = "Participação de cada fonte na geração anual do SIN",
+       subtitle = "Eólica e solar ganham espaço ano a ano; a térmica dispara em 2021",
+       x = NULL, y = "Participação na geração", fill = NULL, caption = fonte_dados)
+```
+
+### Barras agrupadas
+
+```{r barras-agrupadas}
+reg_longo %>%
+  filter(ano == 2025) %>%
+  group_by(subsistema, fonte) %>%
+  summarise(gw = mean(mw) / 1000, .groups = "drop") %>%
+  ggplot(aes(x = subsistema, y = gw, fill = fonte)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  scale_fill_manual(values = cores_fonte) +
+  labs(title = "Geração média por subsistema e fonte (2025)",
+       subtitle = "O Sudeste depende da água; o Nordeste virou o polo eólico do país",
+       x = NULL, y = "Geração média (GW)", fill = NULL, caption = fonte_dados)
+```
+
+## Distribuições (uma variável)
+
+### Histograma
+
+```{r histograma}
+sin25 <- filter(sin, ano == 2025)
+ggplot(sin25, aes(x = carga / 1000)) +
+  geom_histogram(binwidth = 2, fill = "grey60", color = "white") +
+  geom_vline(xintercept = mean(sin25$carga, na.rm = TRUE) / 1000, linetype = "dashed") +
+  labs(title = "Distribuição da carga horária do SIN em 2025",
+       subtitle = "Linha tracejada = média",
+       x = "Carga (GW)", y = "Nº de horas", caption = fonte_dados)
+```
+
+### Densidade
+
+```{r densidade}
+sin %>%
+  filter(ano %in% c(2016, 2020, 2025)) %>%
+  ggplot(aes(x = carga / 1000, fill = factor(ano))) +
+  geom_density(alpha = 0.5, color = NA) +
+  scale_fill_manual(values = c("2016" = "grey60", "2020" = "#56B4E9", "2025" = "#0072B2")) +
+  labs(title = "A distribuição da carga horária se desloca para a direita",
+       subtitle = "Densidade da carga do SIN em três anos",
+       x = "Carga (GW)", y = "Densidade", fill = NULL, caption = fonte_dados)
+```
+
+### Gráfico Q-Q (normalidade)
+
+```{r qqplot}
+dia25 <- filter(sin_dia, ano == 2025)
+ggplot(dia25, aes(sample = carga / 1000)) +
+  stat_qq(color = "grey30") +
+  stat_qq_line(color = "#D55E00", linewidth = 1) +
+  labs(title = "Gráfico Q-Q da carga média diária (2025)",
+       subtitle = "Desvios nas caudas: fins de semana e feriados puxam a cauda inferior",
+       x = "Quantis teóricos (normal)", y = "Quantis observados (GW)", caption = fonte_dados)
+
+shapiro.test(dia25$carga)
+```
+
+## Comparação entre grupos
+
+### Boxplot: sazonalidade da carga
+
+```{r boxplot}
+ggplot(sin_dia, aes(x = mes, y = carga / 1000)) +
+  geom_boxplot(fill = "#56B4E9", alpha = 0.6, outlier.size = 0.8) +
+  labs(title = "Carga média diária do SIN por mês (2016–2025)",
+       subtitle = "O verão (dez–mar) concentra os maiores valores, efeito do ar-condicionado",
+       x = NULL, y = "Carga (GW)", caption = fonte_dados)
+```
+
+### Violino com pontos: a "safra dos ventos" no Nordeste
+
+```{r violino}
+ne_dia <- reg %>%
+  filter(subsistema == "Nordeste") %>%
+  group_by(data) %>%
+  summarise(eolica = mean(eolica)) %>%
+  mutate(ano = year(data),
+         mes = factor(meses[month(data)], levels = meses),
+         safra = if_else(month(data) %in% 7:11, "Safra (jul–nov)", "Fora da safra"))
+
+ne_dia %>%
+  filter(ano == 2025) %>%
+  ggplot(aes(x = mes, y = eolica / 1000, fill = safra)) +
+  geom_violin(alpha = 0.5, color = NA) +
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.6) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.5, linewidth = 0.3) +
+  scale_fill_manual(values = c("Safra (jul–nov)" = "#009E73", "Fora da safra" = "grey70")) +
+  labs(title = "Geração eólica diária no Nordeste por mês (2025)",
+       subtitle = "Cada ponto é um dia; a barra horizontal é a mediana",
+       x = NULL, y = "Geração eólica média (GW)", fill = NULL, caption = fonte_dados)
+```
+
+### Ridgeline: a evolução da participação eólica + solar
+
+```{r ridgeline, fig.height=6.5}
+ggplot(sin_dia, aes(x = vre, y = factor(ano), fill = after_stat(x))) +
+  geom_density_ridges_gradient(scale = 2, rel_min_height = 0.01, color = "white") +
+  scale_x_continuous(labels = label_percent()) +
+  scale_fill_gradient(low = "#C7E9C0", high = "#00441B", guide = "none") +
+  labs(title = "Participação diária de eólica + solar na geração do SIN",
+       subtitle = "A distribuição inteira se desloca para a direita a cada ano",
+       x = "Participação eólica + solar", y = NULL, caption = fonte_dados)
+```
+
+## Relação entre variáveis
+
+### Dispersão com regressão: hidráulica vs. térmica
+
+```{r dispersao}
+ggplot(sin_dia, aes(x = hidraulica / 1000, y = termica / 1000)) +
+  geom_point(aes(color = ano), alpha = 0.5, size = 1.2) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "grey15", linewidth = 1) +
+  scale_color_viridis_c(option = "mako", direction = -1, breaks = c(2016, 2020, 2025)) +
+  labs(title = "Quando a água falta, as térmicas entram",
+       subtitle = "Médias diárias do SIN com reta de regressão e IC de 95%",
+       x = "Geração hidráulica (GW)", y = "Geração térmica (GW)",
+       color = "Ano", caption = fonte_dados) +
+  theme(legend.key.width = unit(1.5, "cm"))
+```
+
+### Gráfico de bolhas: trajetória dos subsistemas
+
+```{r bolhas, fig.height=6}
+sub_ano <- reg %>%
+  group_by(subsistema, ano) %>%
+  summarise(carga = mean(carga, na.rm = TRUE) / 1000,
+            vre   = sum(eolica + solar) / sum(geracao),
+            ger   = mean(geracao) / 1000, .groups = "drop")
+
+ggplot(sub_ano, aes(x = carga, y = vre, color = subsistema)) +
+  geom_path(linewidth = 0.6, arrow = arrow(length = unit(0.2, "cm"))) +
+  geom_point(aes(size = ger), alpha = 0.7) +
+  geom_text(data = filter(sub_ano, ano %in% c(2016, 2025)),
+            aes(label = ano), size = 3, vjust = -1.4, show.legend = FALSE) +
+  scale_x_log10() +
+  scale_y_continuous(labels = label_percent(), expand = expansion(mult = c(0.05, 0.12))) +
+  scale_color_manual(values = cores_sub) +
+  scale_size_area(max_size = 14) +
+  labs(title = "Trajetória de cada subsistema, 2016 → 2025",
+       subtitle = "Tamanho da bolha = geração média; a seta indica o sentido do tempo",
+       x = "Carga média (GW, escala log)", y = "Participação eólica + solar",
+       color = NULL, size = "Geração (GW)", caption = fonte_dados) +
+  theme(legend.box = "vertical")
+```
+
+### Matriz de correlação
+
+```{r correlacao, fig.width=6.5, fig.height=6.5}
+M <- sin_dia %>%
+  transmute(Carga = carga, `Hidráulica` = hidraulica, `Térmica` = termica,
+            `Eólica` = eolica, Solar = solar, `% eól.+sol.` = vre) %>%
+  cor(method = "spearman")
+
+corrplot(M, method = "color", type = "upper", addCoef.col = "black",
+         tl.col = "black", tl.srt = 45, diag = FALSE,
+         col = COL2("RdBu", 200), title = "Correlação de Spearman (médias diárias do SIN)",
+         mar = c(0, 0, 2, 0))
+```
+
+## Séries temporais
+
+### Gráfico de linhas com eventos anotados
+
+```{r linhas}
+mensal_fonte <- sin_longo %>%
+  group_by(mes_ini = floor_date(data, "month"), fonte) %>%
+  summarise(gw = mean(mw) / 1000, .groups = "drop")
+
+ggplot(mensal_fonte, aes(x = mes_ini, y = gw, color = fonte)) +
+  annotate("rect", xmin = as.Date("2021-05-01"), xmax = as.Date("2021-11-30"),
+           ymin = -Inf, ymax = Inf, fill = "#D55E00", alpha = 0.1) +
+  annotate("text", x = as.Date("2021-08-15"), y = 62, label = "Crise\nhídrica",
+           size = 3.3, color = "#D55E00") +
+  geom_vline(xintercept = as.Date("2020-03-23"), linetype = "dotted") +
+  annotate("text", x = as.Date("2020-02-01"), y = 62, label = "COVID-19",
+           size = 3.3, hjust = 1) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = cores_fonte) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(title = "Geração média mensal do SIN por fonte",
+       x = NULL, y = "Geração média (GW)", color = NULL, caption = fonte_dados)
+```
+
+### Área empilhada
+
+```{r area}
+ggplot(mensal_fonte, aes(x = mes_ini, y = gw, fill = fonte)) +
+  geom_area(color = "white", linewidth = 0.2) +
+  scale_fill_manual(values = cores_fonte) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(title = "Composição da geração do SIN mês a mês",
+       subtitle = "A altura total é a geração média mensal",
+       x = NULL, y = "Geração média (GW)", fill = NULL, caption = fonte_dados)
+```
+
+### Pequenos múltiplos (facetas)
+
+```{r facetas, fig.height=6.5}
+reg_longo %>%
+  group_by(subsistema, mes_ini = floor_date(data, "month"), fonte) %>%
+  summarise(gw = mean(mw) / 1000, .groups = "drop") %>%
+  ggplot(aes(x = mes_ini, y = gw, color = fonte)) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ subsistema, scales = "free_y") +
+  scale_color_manual(values = cores_fonte) +
+  scale_x_date(date_breaks = "3 years", date_labels = "%Y") +
+  labs(title = "Cada subsistema tem a sua matriz",
+       subtitle = "Escala do eixo y livre em cada painel",
+       x = NULL, y = "Geração média mensal (GW)", color = NULL, caption = fonte_dados)
+```
+
+### Mapa de calor (heatmap): hora × mês
+
+```{r heatmap, fig.height=6}
+sin_longo %>%
+  filter(ano == 2025, fonte %in% c("Eólica", "Solar")) %>%
+  group_by(fonte, mes, hora) %>%
+  summarise(mw = mean(mw), .groups = "drop") %>%
+  group_by(fonte) %>%
+  mutate(pct = mw / max(mw)) %>%
+  ggplot(aes(x = hora, y = fct_rev(mes), fill = pct)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  facet_wrap(~ fonte) +
+  scale_fill_viridis_c(option = "mako", direction = -1, labels = label_percent(),
+                       name = "% do pico") +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "Eólica e solar se complementam",
+       subtitle = "Geração média por hora do dia e mês (2025), em % do pico de cada fonte",
+       x = "Hora do dia", y = NULL, caption = fonte_dados) +
+  theme(panel.grid = element_blank(), legend.position = "right")
+```
+
+O sol gera ao meio-dia, enquanto o vento do Nordeste sopra mais **à noite** e
+no **segundo semestre**. Essa complementaridade é um argumento técnico
+importante para expandir as duas fontes juntas.
+
+### Perfil diário: a "curva do pato"
+
+A **carga líquida** é a carga menos a geração eólica e solar, ou seja, o que
+as fontes controláveis (hidráulica e térmica) precisam atender.
+
+```{r curva-pato}
+sin %>%
+  filter(ano %in% c(2016, 2025)) %>%
+  group_by(ano, hora) %>%
+  # a carga líquida é calculada ANTES de resumir a carga (ordem importa no summarise)
+  summarise(liquida = mean(carga - eolica - solar, na.rm = TRUE) / 1000,
+            carga   = mean(carga, na.rm = TRUE) / 1000,
+            .groups = "drop") %>%
+  ggplot(aes(x = hora)) +
+  geom_ribbon(aes(ymin = liquida, ymax = carga), fill = "#009E73", alpha = 0.25) +
+  geom_line(aes(y = carga, linetype = "Carga"), linewidth = 1) +
+  geom_line(aes(y = liquida, linetype = "Carga líquida"), linewidth = 1, color = "#0072B2") +
+  facet_wrap(~ ano) +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "O surgimento da 'curva do pato' no Brasil",
+       subtitle = "Área verde = parcela atendida por eólica + solar (perfil horário médio)",
+       x = "Hora do dia", y = "GW", linetype = NULL, caption = fonte_dados)
+```
+
+Em 2025 a carga líquida **despenca ao meio-dia** e sobe rapidamente no fim da
+tarde, quando o sol se põe. Isso exige que as hidrelétricas e as térmicas
+aumentem a geração muito rápido, um desafio operacional novo para o ONS.
+
+### Barras divergentes: quem exporta e quem importa energia
+
+```{r divergente, fig.height=6}
+reg %>%
+  group_by(subsistema, ano) %>%
+  summarise(inter = mean(intercambio, na.rm = TRUE) / 1000, .groups = "drop") %>%
+  mutate(sentido = if_else(inter >= 0, "Exporta", "Importa")) %>%
+  ggplot(aes(x = factor(ano), y = inter, fill = sentido)) +
+  geom_col(width = 0.75) +
+  geom_hline(yintercept = 0, color = "grey30") +
+  facet_wrap(~ subsistema) +
+  scale_fill_manual(values = c("Exporta" = "#009E73", "Importa" = "#CC6677")) +
+  scale_x_discrete(breaks = c("2016", "2019", "2022", "2025")) +
+  labs(title = "Intercâmbio médio anual de energia entre subsistemas",
+       subtitle = "O Nordeste passou de importador a exportador líquido graças aos ventos",
+       x = NULL, y = "Intercâmbio médio (GW)", fill = NULL, caption = fonte_dados)
+```
+
+## Rankings e comparações
+
+### Gráfico de pirulito (lollipop): quem mais cresceu
+
+```{r lollipop, fig.height=6.5}
+reg_longo %>%
+  filter(ano %in% c(2016, 2025)) %>%
+  group_by(subsistema, fonte, ano) %>%
+  summarise(twh = sum(mw) / 1e6, .groups = "drop") %>%
+  pivot_wider(names_from = ano, values_from = twh, names_prefix = "a") %>%
+  mutate(delta = a2025 - a2016,
+         rotulo = fct_reorder(paste(subsistema, "–", fonte), delta)) %>%
+  ggplot(aes(x = delta, y = rotulo, color = fonte)) +
+  geom_vline(xintercept = 0, color = "grey50") +
+  geom_segment(aes(x = 0, xend = delta, yend = rotulo), linewidth = 1) +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = cores_fonte) +
+  labs(title = "Variação da geração anual entre 2016 e 2025",
+       subtitle = "Cada combinação de subsistema e fonte",
+       x = "Variação (TWh/ano)", y = NULL, color = NULL, caption = fonte_dados)
+```
+
+### Gráfico de halteres (dumbbell): 2016 vs. 2025
+
+```{r dumbbell, fig.height=4.5}
+sub_ano %>%
+  filter(ano %in% c(2016, 2025)) %>%
+  select(subsistema, ano, vre) %>%
+  pivot_wider(names_from = ano, values_from = vre, names_prefix = "a") %>%
+  mutate(subsistema = fct_reorder(subsistema, a2025)) %>%
+  ggplot(aes(y = subsistema)) +
+  geom_segment(aes(x = a2016, xend = a2025, yend = subsistema),
+               color = "grey70", linewidth = 1.5) +
+  geom_point(aes(x = a2016, color = "2016"), size = 4) +
+  geom_point(aes(x = a2025, color = "2025"), size = 4) +
+  scale_x_continuous(labels = label_percent()) +
+  scale_color_manual(values = c("2016" = "grey55", "2025" = "#009E73")) +
+  labs(title = "Participação eólica + solar na geração de cada subsistema",
+       x = "Participação eólica + solar", y = NULL, color = NULL, caption = fonte_dados)
+```
+
+# Inferência estatística
+
+## H1 – A participação eólica + solar cresceu?
+
+Ajustamos uma regressão da participação mensal contra o tempo, controlando
+pela sazonalidade com uma variável indicadora para cada mês.
+
+```{r h1}
+mensal_vre <- sin_dia %>%
+  group_by(mes_ini = floor_date(data, "month")) %>%
+  summarise(vre = mean(vre)) %>%
+  mutate(t   = as.numeric(mes_ini - min(mes_ini)) / 365.25,   # anos desde jan/2016
+         mes = factor(meses[month(mes_ini)], levels = meses))
+
+modelo_h1 <- lm(vre ~ t + mes, data = mensal_vre)
+summary(modelo_h1)$coefficients[1:2, ]
+
+# Comparação direta 2016 vs. 2025 (dias como observações)
+wilcox.test(vre ~ ano, data = filter(sin_dia, ano %in% c(2016, 2025)))
+```
+
+**Interpretação:** o coeficiente de `t` é o ganho médio de participação por
+ano, já descontada a sazonalidade. Multiplique por 100 para ler em pontos
+percentuais por ano.
+
+## H2 – Existe uma "safra dos ventos" no Nordeste?
+
+```{r h2}
+ne_dia %>%
+  group_by(safra) %>%
+  summarise(media_gw = mean(eolica) / 1000, mediana_gw = median(eolica) / 1000, dias = n())
+
+t.test(eolica ~ safra, data = ne_dia)        # Welch (variâncias diferentes)
+wilcox.test(eolica ~ safra, data = ne_dia)   # alternativa não paramétrica
+
+# ANOVA por mês, controlando a tendência de crescimento com o ano
+anova_h2 <- aov(eolica ~ factor(ano) + mes, data = ne_dia)
+summary(anova_h2)
+```
+
+## H3 – A térmica compensa a hidráulica?
+
+```{r h3}
+cor.test(sin_dia$hidraulica, sin_dia$termica, method = "pearson")
+cor.test(sin_dia$hidraulica, sin_dia$termica, method = "spearman")
+
+modelo_h3 <- lm(I(termica / 1000) ~ I(hidraulica / 1000) + I(eolica / 1000) +
+                  I(solar / 1000) + I(carga / 1000), data = sin_dia)
+summary(modelo_h3)
+```
+
+### Diagnóstico do modelo
+
+```{r diagnostico, fig.height=7}
+par(mfrow = c(2, 2))
+plot(modelo_h3)
+par(mfrow = c(1, 1))
+```
+
+Os quatro gráficos verificam os pressupostos da regressão: linearidade
+(resíduos vs. ajustados), normalidade dos resíduos (Q-Q), homocedasticidade
+(scale-location) e pontos influentes (distância de Cook).
+
+# Machine learning
+
+## ML1 – Previsão do consumo do dia seguinte (aprendizado supervisionado)
+
+**Problema:** prever a **carga média do SIN no dia seguinte** (em GW) a partir
+do histórico e do calendário. É a tarefa clássica de previsão de curto prazo
+que o ONS faz todos os dias para programar a operação.
+
+### Enriquecimento: calendário de feriados nacionais
+
+A base do ONS não informa feriados, mas eles derrubam o consumo. Por isso a
+base foi **enriquecida** com os feriados nacionais, calculados em R: as datas
+fixas e as móveis, que dependem da Páscoa (Carnaval, Sexta-feira Santa e
+Corpus Christi). O Dia da Consciência Negra entra a partir de 2024, quando
+virou feriado nacional.
+
+```{r ml-feriados}
+# Data da Páscoa (algoritmo de Meeus/Jones/Butcher)
+pascoa <- function(ano) {
+  a <- ano %% 19; b <- ano %/% 100; c <- ano %% 100; d <- b %/% 4; e <- b %% 4
+  f <- (b + 8) %/% 25; g <- (b - f + 1) %/% 3; h <- (19 * a + b - d - g + 15) %% 30
+  i <- c %/% 4; k <- c %% 4; l <- (32 + 2 * e + 2 * i - h - k) %% 7
+  m <- (a + 11 * h + 22 * l) %/% 451
+  mes <- (h + l - 7 * m + 114) %/% 31
+  dia <- ((h + l - 7 * m + 114) %% 31) + 1
+  as.Date(sprintf("%d-%02d-%02d", ano, mes, dia))
+}
+
+feriados_nacionais <- function(anos) {
+  map(anos, function(a) {
+    p <- pascoa(a)
+    fixos <- c("01-01", "04-21", "05-01", "09-07", "10-12", "11-02", "11-15", "12-25")
+    if (a >= 2024) fixos <- c(fixos, "11-20")            # Consciência Negra
+    c(as.Date(paste0(a, "-", fixos)),
+      p - 48, p - 47,                                     # Carnaval (seg. e ter.)
+      p - 2,                                              # Sexta-feira Santa
+      p + 60)                                             # Corpus Christi
+  }) %>% do.call(c, .)
+}
+
+feriados <- feriados_nacionais(2016:2026)
+length(feriados)
+```
+
+### Engenharia de features
+
+```{r ml-features}
+diario <- sin %>%
+  group_by(data) %>%
+  summarise(carga = mean(carga, na.rm = TRUE) / 1000) %>%   # GW
+  arrange(data) %>%
+  mutate(
+    # histórico (só informação disponível ATÉ a véspera: sem vazamento)
+    lag1   = lag(carga, 1),
+    lag7   = lag(carga, 7),
+    lag365 = lag(carga, 365),
+    media7 = rowMeans(sapply(1:7, function(k) lag(carga, k))),
+    # calendário
+    dia_semana = wday(data, week_start = 1),
+    mes        = month(data),
+    dia_ano    = yday(data),
+    tendencia  = as.numeric(data - min(data)) / 365.25,
+    # enriquecimento
+    feriado     = as.integer(data %in% feriados),
+    vespera_pos = as.integer((data + 1) %in% feriados | (data - 1) %in% feriados)
+  ) %>%
+  drop_na()
+```
+
+| Feature | Tipo | Descrição |
+|---|---|---|
+| `lag1`, `lag7`, `lag365` | Histórico | Carga de ontem, de 7 dias atrás e de 1 ano atrás |
+| `media7` | Histórico | Média móvel dos últimos 7 dias |
+| `dia_semana`, `mes`, `dia_ano` | Calendário | Posição do dia na semana e no ano |
+| `tendencia` | Calendário | Anos desde 2016 (crescimento do consumo) |
+| `feriado`, `vespera_pos` | Enriquecimento | Feriado nacional e dia vizinho a um feriado |
+
+### Divisão treino/teste no tempo
+
+Em séries temporais a divisão **não pode ser aleatória**: o modelo não pode
+"ver o futuro". Treinamos com **2016–2023** e testamos em **2024–2025**,
+dois anos que o modelo nunca viu.
+
+```{r ml-divisao}
+treino <- filter(diario, year(data) <= 2023)
+teste  <- filter(diario, year(data) >= 2024)
+c(treino = nrow(treino), teste = nrow(teste))
+```
+
+### Uma lição de engenharia: árvores não extrapolam
+
+Modelos de árvore (random forest, XGBoost) só preveem valores **dentro da faixa
+vista no treino**. Como o consumo cresce, o teste tem dias com carga acima de
+qualquer dia do treino (máximo de `r round(max(treino$carga), 1)` GW no treino
+contra `r round(max(teste$carga), 1)` GW no teste). A solução é mudar o **alvo**:
+em vez da carga em GW, o modelo aprende a carga **relativa à média da última
+semana** (`carga / media7`). Depois a previsão é multiplicada de volta pela média.
+
+```{r ml-modelos}
+metricas <- function(real, prev) {
+  c(MAE = mean(abs(real - prev)), RMSE = sqrt(mean((real - prev)^2)),
+    MAPE = 100 * mean(abs(real - prev) / real))
+}
+
+x_abs <- c("lag1", "lag7", "lag365", "media7", "dia_semana", "mes", "dia_ano",
+           "tendencia", "feriado", "vespera_pos")
+x_rel <- c("lag1", "lag7", "lag365", "dia_semana", "mes", "dia_ano",
+           "feriado", "vespera_pos")
+
+# versão relativa das bases: tudo dividido pela média dos últimos 7 dias
+relativo <- function(d) {
+  mutate(d, alvo = carga / media7,
+         across(c(lag1, lag7, lag365), ~ .x / media7))
+}
+treino_r <- relativo(treino)
+teste_r  <- relativo(teste)
+
+xgb_ajusta <- function(x, y) {
+  set.seed(42)
+  xgb.train(params = list(objective = "reg:squarederror", eta = 0.05, max_depth = 5,
+                          subsample = 0.8, colsample_bytree = 0.8),
+            data = xgb.DMatrix(as.matrix(x), label = y), nrounds = 600, verbose = 0)
+}
+xgb_prev <- function(modelo, x) predict(modelo, xgb.DMatrix(as.matrix(x)))
+
+prev <- tibble(data = teste$data, real = teste$carga)
+
+# 0. Referência ingênua: "amanhã = mesmo dia da semana passada"
+prev$ingenuo <- teste$lag7
+
+# 1. Regressão linear
+mod_lm <- lm(carga ~ lag1 + lag7 + lag365 + media7 + factor(dia_semana) + factor(mes) +
+               tendencia + feriado + vespera_pos, data = treino)
+prev$linear <- predict(mod_lm, teste)
+
+# 2. Random forest e XGBoost com alvo absoluto (GW)
+set.seed(42)
+mod_rf_abs  <- ranger(carga ~ ., data = treino[, c("carga", x_abs)], num.trees = 500)
+prev$rf_abs <- predict(mod_rf_abs, teste[, x_abs])$predictions
+mod_xgb_abs  <- xgb_ajusta(treino[, x_abs], treino$carga)
+prev$xgb_abs <- xgb_prev(mod_xgb_abs, teste[, x_abs])
+
+# 3. Random forest e XGBoost com alvo relativo
+set.seed(42)
+mod_rf_rel  <- ranger(alvo ~ ., data = treino_r[, c("alvo", x_rel)], num.trees = 500)
+prev$rf_rel <- predict(mod_rf_rel, teste_r[, x_rel])$predictions * teste$media7
+mod_xgb_rel  <- xgb_ajusta(treino_r[, x_rel], treino_r$alvo)
+prev$xgb_rel <- xgb_prev(mod_xgb_rel, teste_r[, x_rel]) * teste$media7
+
+# 4. Ablação: o mesmo XGBoost SEM as features de feriado (vale o enriquecimento?)
+x_sem <- setdiff(x_rel, c("feriado", "vespera_pos"))
+mod_xgb_sem  <- xgb_ajusta(treino_r[, x_sem], treino_r$alvo)
+prev$xgb_sem <- xgb_prev(mod_xgb_sem, teste_r[, x_sem]) * teste$media7
+```
+
+### Resultados no conjunto de teste (2024–2025)
+
+```{r ml-resultados}
+nomes_modelos <- tribble(
+  ~coluna,   ~modelo,                                ~familia,
+  "ingenuo", "Ingênuo (mesmo dia da semana passada)", "Referência",
+  "linear",  "Regressão linear",                      "Estatístico",
+  "rf_abs",  "Random forest – alvo absoluto",         "ML – alvo absoluto",
+  "xgb_abs", "XGBoost – alvo absoluto",               "ML – alvo absoluto",
+  "rf_rel",  "Random forest – alvo relativo",         "ML – alvo relativo",
+  "xgb_rel", "XGBoost – alvo relativo",               "ML – alvo relativo",
+  "xgb_sem", "XGBoost – alvo relativo, sem feriados", "ML – alvo relativo"
+)
+
+resultados <- nomes_modelos %>%
+  mutate(m = map(coluna, ~ metricas(prev$real, prev[[.x]]))) %>%
+  unnest_wider(m) %>%
+  arrange(MAPE)
+
+resultados %>%
+  select(Modelo = modelo, `Família` = familia, `MAE (GW)` = MAE, `RMSE (GW)` = RMSE, `MAPE (%)` = MAPE) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  knitr::kable(caption = "Erro de previsão no teste (2024–2025), do melhor para o pior")
+
+mape <- set_names(resultados$MAPE, resultados$coluna)
+```
+
+```{r ml-metricas, fig.height=5}
+cores_familia <- c("Referência" = "grey60", "Estatístico" = "#0072B2",
+                   "ML – alvo absoluto" = "#E69F00", "ML – alvo relativo" = "#009E73")
+
+ggplot(resultados, aes(x = MAPE, y = fct_reorder(modelo, -MAPE), fill = familia)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f%%", MAPE)), hjust = -0.15, size = 3.8) +
+  scale_fill_manual(values = cores_familia) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Erro médio percentual (MAPE) de cada modelo no teste",
+       subtitle = "Menor é melhor · previsão da carga do dia seguinte, 2024–2025",
+       x = "MAPE (%)", y = NULL, fill = NULL, caption = fonte_dados) +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+**Interpretação:** o melhor modelo é o **XGBoost com alvo relativo**, com erro
+médio de **`r round(mape["xgb_rel"], 2)`%**, contra `r round(mape["ingenuo"], 2)`%
+da referência ingênua e `r round(mape["linear"], 2)`% da regressão linear.
+Com o alvo absoluto, os mesmos algoritmos ficam **piores que a regressão
+linear** (`r round(mape["xgb_abs"], 2)`% no XGBoost), porque não conseguem
+extrapolar o crescimento do consumo. Ou seja, a **engenharia do alvo** valeu
+mais do que a escolha do algoritmo. Retirar as features de feriado aumenta o
+erro de `r round(mape["xgb_rel"], 2)`% para `r round(mape["xgb_sem"], 2)`%:
+o **enriquecimento** com o calendário ajuda.
+
+```{r ml-previsao}
+prev %>%
+  filter(data >= as.Date("2025-01-01"), data <= as.Date("2025-03-31")) %>%
+  select(data, Real = real, `XGBoost – alvo relativo` = xgb_rel,
+         `XGBoost – alvo absoluto` = xgb_abs) %>%
+  pivot_longer(-data, names_to = "serie", values_to = "gw") %>%
+  mutate(serie = factor(serie, levels = c("Real", "XGBoost – alvo relativo",
+                                          "XGBoost – alvo absoluto"))) %>%
+  ggplot(aes(x = data, y = gw, color = serie, linetype = serie)) +
+  geom_hline(yintercept = max(treino$carga), color = "grey50", linetype = "dotted") +
+  annotate("text", x = as.Date("2025-01-03"), y = max(treino$carga) + 0.8,
+           label = "máximo visto no treino", hjust = 0, size = 3.5, color = "grey40") +
+  geom_line(linewidth = 0.9) +
+  scale_color_manual(values = c("Real" = "grey15", "XGBoost – alvo relativo" = "#009E73",
+                                "XGBoost – alvo absoluto" = "#E69F00")) +
+  scale_linetype_manual(values = c("solid", "solid", "dashed")) +
+  labs(title = "Previsto vs. real no verão de 2025",
+       subtitle = "Com alvo absoluto, a árvore fica presa ao teto do treino; com alvo relativo, acompanha a carga",
+       x = NULL, y = "Carga média diária (GW)", color = NULL, linetype = NULL, caption = fonte_dados)
+```
+
+### Quais fatores mais pesam?
+
+```{r ml-importancia, fig.height=5}
+tipo_feature <- c(lag1 = "Histórico", lag7 = "Histórico", lag365 = "Histórico",
+                  dia_semana = "Calendário", mes = "Calendário", dia_ano = "Calendário",
+                  feriado = "Feriados (enriquecimento)", vespera_pos = "Feriados (enriquecimento)")
+rotulo_feature <- c(lag1 = "Carga de ontem", lag7 = "Carga de 7 dias atrás",
+                    lag365 = "Carga de 1 ano atrás", dia_semana = "Dia da semana",
+                    mes = "Mês", dia_ano = "Dia do ano", feriado = "É feriado",
+                    vespera_pos = "Véspera ou dia após feriado")
+
+importancia <- xgb.importance(model = mod_xgb_rel) %>%
+  as_tibble() %>%
+  mutate(tipo = tipo_feature[Feature], rotulo = rotulo_feature[Feature])
+
+ggplot(importancia, aes(x = Gain, y = fct_reorder(rotulo, Gain), fill = tipo)) +
+  geom_col(width = 0.7) +
+  scale_x_continuous(labels = label_percent()) +
+  scale_fill_manual(values = c("Histórico" = "#0072B2", "Calendário" = "#56B4E9",
+                               "Feriados (enriquecimento)" = "#D55E00")) +
+  labs(title = "Importância das variáveis no XGBoost",
+       subtitle = "Ganho: quanto cada variável reduz o erro nas divisões das árvores",
+       x = "Importância (ganho)", y = NULL, fill = NULL, caption = fonte_dados)
+```
+
+O **dia da semana** é a variável mais importante: o consumo cai muito nos
+fins de semana. Em seguida vêm a carga de ontem e a de uma semana atrás. O
+**feriado**, que veio do enriquecimento, aparece entre as principais variáveis.
+
+## ML2 – Tipos de dia com k-means (aprendizado não supervisionado)
+
+Cada dia foi descrito pelo **formato** da sua curva de carga líquida
+(carga − eólica − solar): 24 valores, um por hora, divididos pela média do
+dia. Assim o algoritmo agrupa os dias pelo **formato** da curva, não pelo nível.
+Nenhum rótulo foi fornecido: o k-means não sabe o que é fim de semana, feriado
+ou curva do pato.
+
+```{r ml-cluster-prep}
+perfis <- sin %>%
+  mutate(liquida = carga - eolica - solar) %>%
+  group_by(data) %>%
+  filter(n() == 24, !anyNA(liquida)) %>%
+  mutate(perfil = liquida / mean(liquida)) %>%
+  ungroup() %>%
+  select(data, hora, perfil) %>%
+  pivot_wider(names_from = hora, values_from = perfil, names_prefix = "h")
+
+X <- as.matrix(select(perfis, starts_with("h")))
+dim(X)
+```
+
+### Quantos grupos? O método do cotovelo
+
+```{r ml-cotovelo, fig.height=4.5}
+set.seed(42)
+cotovelo <- tibble(k = 1:8) %>%
+  mutate(wss = map_dbl(k, ~ kmeans(X, .x, nstart = 20, iter.max = 50)$tot.withinss),
+         wss_rel = wss / max(wss))
+
+ggplot(cotovelo, aes(x = k, y = wss_rel)) +
+  geom_line(linewidth = 1, color = "grey40") +
+  geom_point(size = 3, color = "grey40") +
+  geom_point(data = filter(cotovelo, k == 4), size = 5, color = "#D55E00") +
+  scale_x_continuous(breaks = 1:8) +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Método do cotovelo para escolher o número de grupos",
+       subtitle = "A partir de k = 4 o ganho de cada grupo extra fica pequeno",
+       x = "Número de grupos (k)", y = "Variação não explicada (WSS relativa)",
+       caption = fonte_dados)
+```
+
+```{r ml-kmeans}
+set.seed(42)
+km <- kmeans(X, centers = 4, nstart = 25, iter.max = 50)
+perfis$grupo_id <- km$cluster
+
+# Nomeia cada grupo a partir das suas características (os rótulos não foram usados no ajuste)
+resumo_grupos <- perfis %>%
+  mutate(fds_feriado = wday(data, week_start = 1) >= 6 | data %in% feriados) %>%
+  group_by(grupo_id) %>%
+  summarise(dias = n(), ano_medio = mean(year(data)), pct_fds_feriado = mean(fds_feriado),
+            meio_dia = mean(h12), pico_19h = mean(h19)) %>%
+  mutate(nome = paste(if_else(pct_fds_feriado > 0.4, "Fim de semana/feriado", "Dia útil"),
+                      if_else(meio_dia < 0.9, "com curva do pato", "clássico")),
+         nome = make.unique(nome, sep = " "))
+
+perfis <- left_join(perfis, select(resumo_grupos, grupo_id, nome), by = "grupo_id")
+
+resumo_grupos %>%
+  transmute(Grupo = nome, Dias = dias, `Ano médio` = round(ano_medio, 1),
+            `% fim de semana ou feriado` = round(100 * pct_fds_feriado),
+            `Carga líquida ao meio-dia (× média)` = round(meio_dia, 2),
+            `Carga líquida às 19h (× média)` = round(pico_19h, 2)) %>%
+  knitr::kable(caption = "Os 4 tipos de dia encontrados pelo k-means")
+
+cores_grupo <- c("Dia útil clássico" = "#0072B2", "Fim de semana/feriado clássico" = "#56B4E9",
+                 "Dia útil com curva do pato" = "#D55E00",
+                 "Fim de semana/feriado com curva do pato" = "#E69F00")
+```
+
+```{r ml-centroides}
+perfis %>%
+  pivot_longer(starts_with("h"), names_to = "hora", values_to = "perfil",
+               names_transform = list(hora = ~ as.integer(sub("h", "", .x)))) %>%
+  group_by(nome, hora) %>%
+  summarise(perfil = mean(perfil), .groups = "drop") %>%
+  ggplot(aes(x = hora, y = perfil, color = nome)) +
+  geom_hline(yintercept = 1, color = "grey70") +
+  geom_line(linewidth = 1.3) +
+  scale_color_manual(values = cores_grupo) +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "O formato médio de cada tipo de dia",
+       subtitle = "Carga líquida horária dividida pela média do dia (1 = média)",
+       x = "Hora do dia", y = "Carga líquida (× média do dia)", color = NULL,
+       caption = fonte_dados) +
+  guides(color = guide_legend(nrow = 2))
+```
+
+```{r ml-composicao}
+perfis %>%
+  count(ano = year(data), nome) %>%
+  ggplot(aes(x = factor(ano), y = n, fill = nome)) +
+  geom_col(position = "fill", width = 0.75, color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = cores_grupo) +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Os dias com curva do pato surgem em 2020 e dominam a partir de 2023",
+       subtitle = "Participação de cada tipo de dia em cada ano",
+       x = NULL, y = "Dias do ano", fill = NULL, caption = fonte_dados) +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+**Interpretação:** sem saber nada sobre calendário ou energia solar, o k-means
+separou os dias em dois eixos: **dia útil × fim de semana/feriado** e
+**formato clássico × curva do pato**. Os dias com curva do pato praticamente
+não existem até 2021 e, em 2025, já são **`r round(100 * mean(grepl("pato", perfis$nome[year(perfis$data) == 2025])))`%**
+dos dias. O algoritmo redescobriu sozinho o principal achado da análise exploratória.
+
+Os nomes dos grupos descrevem a **maioria** dos seus dias, não todos: o grupo
+“fim de semana/feriado com curva do pato” também reúne dias úteis muito
+ensolarados, em que o afundamento do meio-dia é tão forte quanto num domingo.
+
+# Conclusões
+
+1. **H1 confirmada.** A participação eólica + solar passou de **5,7% (2016)
+   para 29,6% (2025)** da geração do SIN, um ganho de cerca de **2,6 pontos
+   percentuais por ano** já descontada a sazonalidade (p < 0,001).
+2. **H2 confirmada.** A geração eólica média no Nordeste é cerca de **50% maior**
+   na safra dos ventos (8,8 vs. 5,9 GW; Welch e Wilcoxon, p < 0,001). O
+   Nordeste passou de importador a **exportador líquido** de energia a partir de 2020.
+3. **H3 confirmada.** Hidráulica e térmica têm correlação negativa moderada
+   (**r = −0,55**, p < 0,001): a térmica funciona como reserva acionada quando
+   falta água, como ficou claro na crise hídrica de 2021.
+4. **Achado adicional:** a expansão solar já criou uma "curva do pato" na carga
+   líquida brasileira, o que aumenta a necessidade de flexibilidade na operação
+   do sistema.
+5. **ML1 – previsão.** O **XGBoost** prevê a carga do dia seguinte com erro médio
+   de **`r round(mape["xgb_rel"], 2)`%**, contra `r round(mape["ingenuo"], 2)`% da
+   referência ingênua. O ganho veio sobretudo da **engenharia do alvo** (carga
+   relativa), que contorna a incapacidade das árvores de extrapolar, e do
+   **enriquecimento** com feriados.
+6. **ML2 – tipos de dia.** Sem rótulos, o **k-means** separou dias úteis de fins
+   de semana e, sozinho, identificou os dias com **curva do pato**, que viraram
+   maioria a partir de 2023.
+
+## Limitações
+
+- A solar desta base é só a **centralizada**. A geração distribuída dos
+  telhados não entra e aparece "escondida" como uma redução da carga.
+- As observações diárias são **autocorrelacionadas**. Os erros-padrão dos
+  testes clássicos ficam subestimados, e modelos de séries temporais
+  (ARIMA, regressão com erros HAC) seriam o passo seguinte.
+- As médias por subsistema escondem diferenças entre usinas e estados.
+- **Previsão:** o modelo prevê só **um dia à frente** e não usa a
+  **temperatura**, que é um fator importante do consumo. Os hiperparâmetros do
+  XGBoost não foram otimizados (sem validação cruzada no tempo).
+
+## Trabalhos futuros
+
+Enriquecer a previsão com temperatura (INMET), otimizar hiperparâmetros com
+validação cruzada em janelas de tempo, prever vários dias à frente e comparar
+com ARIMA ou Prophet. Também incluir dados de reservatórios e chuvas (ENA) e
+cruzar com os preços do mercado de curto prazo (PLD) da CCEE.
+
+# Referências
+
+- ONS – Operador Nacional do Sistema Elétrico. *Balanço de Energia nos Subsistemas*. Dados abertos. <https://dados.ons.org.br>
+- EPE – Empresa de Pesquisa Energética. *Balanço Energético Nacional*. <https://www.epe.gov.br>
+- Wickham, H. (2016). *ggplot2: Elegant Graphics for Data Analysis*. Springer.
+- Wickham, H.; Çetinkaya-Rundel, M.; Grolemund, G. (2023). *R for Data Science*, 2ª ed. <https://r4ds.hadley.nz>
+- Hyndman, R. J.; Athanasopoulos, G. (2021). *Forecasting: Principles and Practice*, 3ª ed. <https://otexts.com/fpp3>
+- Wilke, C. O. (2019). *Fundamentals of Data Visualization*. O'Reilly. <https://clauswilke.com/dataviz>
+- Breiman, L. (2001). Random forests. *Machine Learning*, 45(1), 5–32.
+- Chen, T.; Guestrin, C. (2016). XGBoost: A scalable tree boosting system. *Proceedings of the 22nd ACM SIGKDD*, 785–794.
+- MacQueen, J. (1967). Some methods for classification and analysis of multivariate observations. *Proceedings of the 5th Berkeley Symposium*, 281–297.
+
+# Informações da sessão
+
+```{r sessao}
+sessionInfo()
+```
