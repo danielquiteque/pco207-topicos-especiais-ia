@@ -108,28 +108,43 @@ salvar(p_scree, "01_scree")
 col2 <- colorRampPalette(c("darkred", "white", "darkblue"))
 cor_pc <- t(pca$var$cor[, 1:3])                 # componentes nas linhas
 rownames(cor_pc) <- c("PC1", "PC2", "PC3")
-png("figuras/pca/02_corrplot.png", width = 3000, height = 1050, res = 300)
-corrplot(cor_pc, is.corr = FALSE, col = col2(20), col.lim = c(-1, 1),
-         tl.col = "black", tl.cex = 0.85, tl.srt = 90, cl.pos = "b", cl.cex = 0.7,
-         cl.ratio = 0.25, mar = c(0, 0, 1.5, 6),
-         title = "Correlação de cada variável com PC1, PC2 e PC3")
+# Ordena as variáveis pelo componente com que mais se correlacionam
+# (primeiro as do PC1, depois as do PC2 e as do PC3), para formar blocos.
+pc_dominante <- apply(abs(cor_pc), 2, which.max)
+forca        <- apply(abs(cor_pc), 2, max)
+ordem        <- order(pc_dominante, -forca)
+# Destaca só as correlações fortes (|r| ≥ 0,5): as fracas viram 0 (círculo vazio)
+cor_destaque <- cor_pc[, ordem]
+cor_destaque[abs(cor_destaque) < 0.5] <- 0
+png("figuras/pca/02_corrplot.png", width = 3000, height = 1150, res = 300)
+corrplot(cor_destaque, is.corr = FALSE, col = col2(20), col.lim = c(-1, 1),
+         tl.col = "black", tl.cex = 1.15, tl.srt = 90, cl.pos = "b", cl.cex = 0.8,
+         cl.ratio = 0.22, mar = c(0, 0, 1.5, 6), addCoef.col = "white",
+         number.cex = 0.62, number.digits = 1,
+         title = "Correlações fortes (|r| ≥ 0,5) de cada variável com PC1, PC2 e PC3")
 dev.off()
 
 # 3.3 Círculo de correlações (PC1 × PC2)
+# select.var: 11 variáveis representativas das duas histórias (evita rótulos sobrepostos)
+vars_chave <- c("Sol.NE", "Sol.SE", "Carga.N", "Carga.SE", "Eol.NE",   # PC1: transição
+                "Ter.SE", "Ter.N", "Ter.S", "Ter.NE", "Hid.SE", "Hid.N") # PC2: água
 p_var <- fviz_pca_var(pca, axes = c(1, 2), col.var = "contrib",
+                      select.var = list(name = vars_chave),
                       gradient.cols = c("#9ECAE1", "#2E6DB4", "#08306B"),
-                      repel = TRUE, labelsize = 4) +
+                      repel = TRUE, labelsize = 5.5, arrowsize = 0.8) +
   labs(title = "Círculo de correlações (PC1 × PC2)",
-       subtitle = "PC1 = transição renovável e crescimento da carga · PC2 = hidrologia (térmica × hidráulica)",
+       subtitle = "Direita = transição (solar, eólica, carga) · vertical = água (térmica × hidráulica)",
        color = "Contribuição (%)") + tema
 salvar(p_var, "03_circulo", w = 8, h = 7)
 
 # 3.4 Biplot: meses coloridos pelo ano
-p_biplot <- fviz_pca_biplot(pca, axes = c(1, 2), geom.ind = "point", pointsize = 2.5,
+# Só 5 setas (uma por "direção" da história), para os pontos (meses) ficarem visíveis
+p_biplot <- fviz_pca_biplot(pca, axes = c(1, 2), geom.ind = "point", pointsize = 3,
                             col.ind = info$ano, gradient.cols = c("#C6DBEF", "#2E6DB4", "#08306B"),
-                            col.var = "grey25", repel = TRUE, labelsize = 3.5, alpha.var = 0.8) +
-  labs(title = "Biplot: os 120 meses e as 19 variáveis",
-       subtitle = "Os meses andam da esquerda (2016) para a direita (2025)",
+                            select.var = list(name = c("Sol.NE", "Carga.N", "Eol.NE", "Ter.SE", "Hid.SE")),
+                            col.var = "#B23A00", repel = TRUE, labelsize = 5.5, alpha.var = 0.9) +
+  labs(title = "Biplot: os 120 meses e 5 variáveis-chave",
+       subtitle = "Os meses andam da esquerda (2016, claro) para a direita (2025, escuro)",
        color = "Ano") + tema +
   scale_color_gradientn(colours = c("#C6DBEF", "#2E6DB4", "#08306B"), breaks = c(2016, 2019, 2022, 2025), name = "Ano")
 salvar(p_biplot, "04_biplot_ano", w = 9, h = 6.5)
@@ -208,11 +223,28 @@ famd <- FAMD(dados_famd, ncp = 5, graph = FALSE)
 
 round(famd$eig[1:4, ], 1)
 
+# Centro (média) de cada estação nos dois primeiros eixos
+centros <- as_tibble(famd$ind$coord[, 1:2]) |>
+  mutate(estacao = info$estacao) |>
+  group_by(estacao) |>
+  summarise(x = mean(Dim.1), y = mean(Dim.2))
+c_seca  <- filter(centros, startsWith(estacao, "Seca"))
+c_umida <- filter(centros, startsWith(estacao, "Úmida"))
+
 p_famd <- fviz_famd_ind(famd, axes = c(1, 2), geom = "point", habillage = "estacao",
-                        addEllipses = TRUE, palette = c("#D55E00", "#2E6DB4"),
-                        repel = TRUE, labelsize = 4) +
+                        addEllipses = TRUE, ellipse.alpha = 0.08, pointsize = 1.8,
+                        palette = c("#D55E00", "#2E6DB4"), repel = TRUE, labelsize = 4) +
+  annotate("segment", x = c_umida$x, y = c_umida$y, xend = c_seca$x, yend = c_seca$y,
+           linewidth = 1.3, color = "grey15",
+           arrow = arrow(length = unit(0.35, "cm"), type = "closed")) +
+  annotate("label", x = c_seca$x - 0.5, y = c_seca$y + 0.4, hjust = 1, size = 4.8,
+           label = sprintf("média dos meses secos: %s", format(round(c_seca$y, 1), decimal.mark = ",")),
+           color = "#B23A00", fontface = "bold") +
+  annotate("label", x = c_umida$x - 0.5, y = c_umida$y - 0.4, hjust = 1, size = 4.8,
+           label = sprintf("média dos meses úmidos: %s", format(round(c_umida$y, 1), decimal.mark = ",")),
+           color = "#1F4E8C", fontface = "bold") +
   labs(title = "FAMD: geração, carga e estação do ano juntas",
-       subtitle = "A estação (qualitativa) se alinha ao eixo da hidrologia",
+       subtitle = "A média de cada estação se desloca na vertical, ao longo do eixo da água",
        color = "Estação", fill = "Estação", shape = "Estação") + tema
 salvar(p_famd, "09_famd", w = 9, h = 6)
 
